@@ -89,8 +89,8 @@ func TestPin_In(t *testing.T) {
 	}
 
 	p.fEdge = &fakeGPIOFile{}
-	if p.In(gpio.PullNoChange, gpio.NoEdge) == nil {
-		t.Fatal("edge I/O failed")
+	if err := p.In(gpio.PullNoChange, gpio.NoEdge); err != nil {
+		t.Fatal("edge I/O failed", err)
 	}
 
 	p.fEdge = &fakeGPIOFile{data: []byte("none")}

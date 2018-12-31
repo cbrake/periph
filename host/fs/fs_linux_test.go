@@ -5,6 +5,7 @@
 package fs
 
 import (
+	"context"
 	"io/ioutil"
 	"net"
 	"os"
@@ -194,7 +195,25 @@ func TestWakeUpLoop(t *testing.T) {
 	ev.wakeUpLoop(nil)
 }
 
+func TestEvent_Wait(t *testing.T) {
+	ev := event{}
+	// Make sure it doesn't hang.
+	ev.wait(context.Background())
+}
+
 //
+
+// getContext returns an auto-cancelling context after 5 seconds.
+func getContext(t *testing.T) (context.Context, func()) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	go func() {
+		<-ctx.Done()
+		if err := ctx.Err(); err != context.Canceled {
+			t.Fatalf("getContext() time out; test was too slow: %v", err)
+		}
+	}()
+	return ctx, cancel
+}
 
 // getListener returns a preinitialized eventsListenenr
 func getListener(t *testing.T) (*eventsListener, func()) {

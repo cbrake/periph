@@ -5,6 +5,7 @@
 package fs
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strconv"
@@ -86,37 +87,81 @@ func ioctl(f uintptr, op uint, arg uintptr) error {
 	return nil
 }
 
+// event listens for events for a single file thru events.
 type event struct {
-	event   [1]syscall.EpollEvent
-	epollFd int
-	fd      int
+	c  chan time.Time
+	mu sync.Mutex
+	// events before this time are ignored.
+	until time.Time
 }
 
-// makeEvent creates an epoll *edge* triggered event.
-//
-// References:
-// behavior and flags: http://man7.org/linux/man-pages/man7/epoll.7.html
-// syscall.EpollCreate: http://man7.org/linux/man-pages/man2/epoll_create.2.html
-// syscall.EpollCtl: http://man7.org/linux/man-pages/man2/epoll_ctl.2.html
 func (e *event) makeEvent(fd uintptr) error {
-	epollFd, err := syscall.EpollCreate(1)
-	if err != nil {
-		return err
-	}
-	e.epollFd = epollFd
-	e.fd = int(fd)
-	// EPOLLWAKEUP could be used to force the system to not go do sleep while
-	// waiting for an edge. This is generally a bad idea, as we'd instead have
-	// the system to *wake up* when an edge is triggered. Achieving this is
-	// outside the scope of this interface.
-	e.event[0].Events = uint32(epollPRI | epollET)
-	e.event[0].Fd = int32(e.fd)
-	return syscall.EpollCtl(e.epollFd, epollCTLAdd, e.fd, &e.event[0])
+	// Use a buffer channel here, since we don't want the system to hang while
+	// the user is not listening to events.
+	e.c = make(chan time.Time, 16)
+	const flags = epollET | epollPRI
+	return events.addFd(fd, e.c, flags)
 }
 
-func (e *event) wait(timeoutms int) (int, error) {
-	// http://man7.org/linux/man-pages/man2/epoll_wait.2.html
-	return syscall.EpollWait(e.epollFd, e.event[:], timeoutms)
+// wait waits for either the context to be done or an epoll event.
+//
+// Returns zero Time if no event was detected, i.e. the context was canceled
+// first, or if the event was not initialized.
+func (e *event) wait(ctx context.Context) time.Time {
+	if e.c == nil {
+		// Not initialized.
+		return time.Time{}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return time.Time{}
+		case t := <-e.c:
+			e.mu.Lock()
+			until := e.until
+			e.mu.Unlock()
+			if t.Before(until) {
+				// Stale event, ignore.
+				continue
+			}
+			return t
+		}
+	}
+}
+
+func (e *event) peek() time.Time {
+	for {
+		select {
+		case t := <-e.c:
+			e.mu.Lock()
+			until := e.until
+			e.mu.Unlock()
+			if t.Before(until) {
+				// Stale event, ignore.
+				continue
+			}
+			return t
+		default:
+			return time.Time{}
+		}
+	}
+}
+
+// clearAccumulated sets the minimum timestamp events must have.
+func (e *event) clearAccumulated() {
+	// Take time from the loop itself, to ensure consistent monotonic clock.
+	until := events.wakeUpLoop(e.c)
+	e.mu.Lock()
+	e.until = until
+	e.mu.Unlock()
+	// Empty any pending event. This is not fool proof!
+	for {
+		select {
+		case <-e.c:
+		default:
+			return
+		}
+	}
 }
 
 //
@@ -380,6 +425,19 @@ func (e *eventsListener) wakeUpLoop(c <-chan time.Time) time.Time {
 	// time.
 	_, _ = e.r.Read(b[:])
 	return t
+}
+
+// listen wraps addFd() and removeFd(), and listens for edges on the file
+// descriptor fd.
+//
+// Returns an error if listening to the file descriptor failed.
+func (e *eventsListener) listen(ctx context.Context, fd uintptr, c chan<- time.Time) error {
+	const flags = epollET | epollPRI
+	if err := e.addFd(fd, c, flags); err != nil {
+		return err
+	}
+	<-ctx.Done()
+	return e.removeFd(fd)
 }
 
 // events is the global events listener.

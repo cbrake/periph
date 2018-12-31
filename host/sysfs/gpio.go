@@ -5,6 +5,7 @@
 package sysfs
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +49,9 @@ type Pin struct {
 	fValue     fileIO    // handle to /sys/class/gpio/gpio*/value; never closed
 	event      fs.Event  // Initialized once
 	buf        [4]byte   // scratch buffer for Function(), Read() and Out()
+
+	muCancel          sync.Mutex // Used in haltEdge and WaitForEdge
+	cancelWaitForEdge func()     // Cancels a pending WaitForEdge
 }
 
 // String implements conn.Resource.
@@ -145,13 +149,6 @@ func (p *Pin) In(pull gpio.Pull, edge gpio.Edge) error {
 		}
 		p.direction = dIn
 	}
-	// Always push none to help accumulated flush edges. This is not fool proof
-	// but it seems to help.
-	if p.fEdge != nil {
-		if err := seekWrite(p.fEdge, bNone); err != nil {
-			return p.wrap(err)
-		}
-	}
 	// Assume that when the pin was switched, the driver doesn't recall if edge
 	// triggering was enabled.
 	if edge != gpio.NoEdge {
@@ -167,12 +164,6 @@ func (p *Pin) In(pull gpio.Pull, edge gpio.Edge) error {
 				return p.wrap(err)
 			}
 		}
-		// Always reset the edge detection mode to none after starting the epoll
-		// otherwise edges are not always delivered, as observed on an Allwinner A20
-		// running kernel 4.14.14.
-		if err := seekWrite(p.fEdge, bNone); err != nil {
-			return p.wrap(err)
-		}
 		var b []byte
 		switch edge {
 		case gpio.RisingEdge:
@@ -185,18 +176,11 @@ func (p *Pin) In(pull gpio.Pull, edge gpio.Edge) error {
 		if err := seekWrite(p.fEdge, b); err != nil {
 			return p.wrap(err)
 		}
+		p.resetCancel(nil)
 	}
+	// Reset the accumulated events.
+	p.event.ClearAccumulated()
 	p.edge = edge
-	// This helps to remove accumulated edges but this is not 100% sufficient.
-	// Most of the time the interrupts are handled promptly enough that this loop
-	// flushes the accumulated interrupt.
-	// Sometimes the kernel may have accumulated interrupts that haven't been
-	// processed for a long time, it can easily be >300µs even on a quite idle
-	// CPU. In this case, the loop below is not sufficient, since the interrupt
-	// will happen afterward "out of the blue".
-	if edge != gpio.NoEdge {
-		p.WaitForEdge(0)
-	}
 	return nil
 }
 
@@ -222,30 +206,25 @@ func (p *Pin) Read() gpio.Level {
 
 // WaitForEdge implements gpio.PinIn.
 func (p *Pin) WaitForEdge(timeout time.Duration) bool {
-	// Run lockless, as the normal use is to call in a busy loop.
-	var ms int
+	// Run mostly lockless (resetCancel() takes a lock), as the normal use is to
+	// call in a busy loop while potentially other functions are called.
+	ctx := context.Background()
+	var cancel func()
 	if timeout == -1 {
-		ms = -1
+		// No timeout.
+		ctx, cancel = context.WithCancel(ctx)
+	} else if timeout == 0 {
+		// Do a quick peek, ignoring the rest.
+		return p.event.Peek().IsZero()
 	} else {
-		ms = int(timeout / time.Millisecond)
+		// Normal timeout.
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 	}
-	start := time.Now()
-	for {
-		if nr, err := p.event.Wait(ms); err != nil {
-			return false
-		} else if nr == 1 {
-			// TODO(maruel): According to pigpio, the correct way to consume the
-			// interrupt is to call Seek().
-			return true
-		}
-		// A signal occurred.
-		if timeout != -1 {
-			ms = int((timeout - time.Since(start)) / time.Millisecond)
-		}
-		if ms <= 0 {
-			return false
-		}
-	}
+
+	p.resetCancel(cancel)
+	t := p.event.WaitCtx(ctx)
+	p.resetCancel(nil)
+	return !t.IsZero()
 }
 
 // Pull implements gpio.PinIn.
@@ -359,17 +338,31 @@ func (p *Pin) open() error {
 	return p.err
 }
 
-// haltEdge stops any on-going edge detection.
+// haltEdge disables edge detection and unblocks any pending WaitforEdge().
+//
+// Must be called with mu held.
 func (p *Pin) haltEdge() error {
 	if p.edge != gpio.NoEdge {
 		if err := seekWrite(p.fEdge, bNone); err != nil {
 			return p.wrap(err)
 		}
 		p.edge = gpio.NoEdge
-		// This is still important to remove an accumulated edge.
-		p.WaitForEdge(0)
 	}
+	// Reset the accumulated events.
+	p.event.ClearAccumulated()
+	p.resetCancel(nil)
 	return nil
+}
+
+// resetCancel unblocks any pending WaitForEdge(), and optional sets a new
+// canceler.
+func (p *Pin) resetCancel(new func()) {
+	p.muCancel.Lock()
+	if p.cancelWaitForEdge != nil {
+		p.cancelWaitForEdge()
+	}
+	p.cancelWaitForEdge = new
+	p.muCancel.Unlock()
 }
 
 func (p *Pin) wrap(err error) error {

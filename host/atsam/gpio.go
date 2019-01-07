@@ -486,7 +486,6 @@ func (d *driverGPIO) Init() (bool, error) {
 			gpioNum++
 		}
 	}
-	fmt.Printf("Pins: %+v\n", Pins)
 
 	drvGPIO.exportHandle, err = fileIOOpen("/sys/class/gpio/export", os.O_WRONLY)
 	if os.IsPermission(err) {
